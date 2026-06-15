@@ -56,23 +56,7 @@ jobs:
           echo "=== Patch 1: stack_pointer.h ==="
           SP_FILE=arch/arm64/include/asm/stack_pointer.h
           if [ -f "$SP_FILE" ]; then
-            cat > "$SP_FILE" << 'SPEOF'
-            /* SPDX-License-Identifier: GPL-2.0 */
-            /* Patched for Clang 18+ compatibility */
-            #ifndef __ASM_STACK_POINTER_H
-            #define __ASM_STACK_POINTER_H
-            
-            static inline unsigned long get_current_stack_pointer(void)
-            {
-                unsigned long sp;
-                __asm__ volatile("mov %0, sp" : "=r" (sp));
-                return sp;
-            }
-            
-            #define current_stack_pointer get_current_stack_pointer()
-            
-            #endif /* __ASM_STACK_POINTER_H */
-            SPEOF
+            printf '%s\n' '/* SPDX-License-Identifier: GPL-2.0 */' '/* Patched for Clang 18+ compatibility */' '#ifndef __ASM_STACK_POINTER_H' '#define __ASM_STACK_POINTER_H' '' 'static inline unsigned long get_current_stack_pointer(void)' '{' '    unsigned long sp;' '    __asm__ volatile("mov %0, sp" : "=r" (sp));' '    return sp;' '}' '' '#define current_stack_pointer get_current_stack_pointer()' '' '#endif /* __ASM_STACK_POINTER_H */' > "$SP_FILE"
             echo "Patched: $SP_FILE"
           else
             echo "NOT FOUND: $SP_FILE"
