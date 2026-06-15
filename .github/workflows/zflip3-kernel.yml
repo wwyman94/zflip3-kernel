@@ -1,19 +1,10 @@
 name: Build Z Flip 3 Kernel + KernelSU + DroidSpaces
 
 on:
-  workflow_dispatch:
-    inputs:
-      kernelsu_version:
-        description: 'KernelSU version (e.g. v0.9.4, v0.10.0)'
-        required: false
-        default: 'v0.9.4'
-      android_version:
-        description: 'Android version (13 or 14 or 15)'
-        required: false
-        default: '15'
   push:
     branches:
       - main
+      - master
 
 env:
   DEVICE: SM-F7110
@@ -30,15 +21,11 @@ jobs:
     timeout-minutes: 300
 
     steps:
-      - name: Set KernelSU version
+      - name: Set build variables
         id: vars
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "KERNELSU_VERSION=${{ github.event.inputs.kernelsu_version }}" >> $GITHUB_ENV
-          else
-            echo "KERNELSU_VERSION=v0.9.4" >> $GITHUB_ENV
-          fi
-          echo "Using KernelSU version: ${{ env.KERNELSU_VERSION }}"
+          echo "KERNELSU_VERSION=v0.9.4" >> $GITHUB_ENV
+          echo "Using KernelSU version: v0.9.4"
 
       - name: Checkout kernel source
         run: |
@@ -62,86 +49,56 @@ jobs:
             fi
           done
 
-      - name: Patch kernel source with Python3
+      - name: Patch kernel source for Clang 18+ compatibility
         run: |
           cd $GITHUB_WORKSPACE/kernel_source
           
-          echo "=== Installing Python3 ==="
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq python3
+          echo "=== Patch 1: stack_pointer.h ==="
+          SP_FILE=arch/arm64/include/asm/stack_pointer.h
+          if [ -f "$SP_FILE" ]; then
+            cat > "$SP_FILE" << 'SPEOF'
+            /* SPDX-License-Identifier: GPL-2.0 */
+            /* Patched for Clang 18+ compatibility */
+            #ifndef __ASM_STACK_POINTER_H
+            #define __ASM_STACK_POINTER_H
+            
+            static inline unsigned long get_current_stack_pointer(void)
+            {
+                unsigned long sp;
+                __asm__ volatile("mov %0, sp" : "=r" (sp));
+                return sp;
+            }
+            
+            #define current_stack_pointer get_current_stack_pointer()
+            
+            #endif /* __ASM_STACK_POINTER_H */
+            SPEOF
+            echo "Patched: $SP_FILE"
+          else
+            echo "NOT FOUND: $SP_FILE"
+          fi
           
-          echo "=== Patching with Python3 ==="
-          python3 << 'PYEOF'
-          import os
-          import re
+          echo "=== Patch 2: kgdb.h ==="
+          KGDB_FILE=arch/arm64/include/asm/kgdb.h
+          if [ -f "$KGDB_FILE" ]; then
+            sed -i 's/KGDB_COMPILED_DBG_BRK_IMM\s\+0x401/KGDB_COMPILED_DBG_BRK_IMM 0x3/g' "$KGDB_FILE"
+            echo "Patched: $KGDB_FILE"
+            grep -n "0x3" "$KGDB_FILE" | head -3
+          else
+            echo "NOT FOUND: $KGDB_FILE"
+          fi
           
-          base = os.getcwd()
-          
-          # Patch 1: stack_pointer.h - replace global register variable with inline asm
-          sp_file = os.path.join(base, 'arch/arm64/include/asm/stack_pointer.h')
-          if os.path.exists(sp_file):
-              with open(sp_file, 'r') as f:
-                  content = f.read()
-              new_content = '''/* SPDX-License-Identifier: GPL-2.0 */
-/* Patched for Clang 18+ compatibility */
-#ifndef __ASM_STACK_POINTER_H
-#define __ASM_STACK_POINTER_H
-
-static inline unsigned long get_current_stack_pointer(void)
-{
-    unsigned long sp;
-    __asm__ volatile("mov %0, sp" : "=r" (sp));
-    return sp;
-}
-
-#define current_stack_pointer get_current_stack_pointer()
-
-#endif /* __ASM_STACK_POINTER_H */
-'''
-              with open(sp_file, 'w') as f:
-                  f.write(new_content)
-              print(f"Patched: {sp_file}")
-          else:
-              print(f"NOT FOUND: {sp_file}")
-          
-          # Patch 2: kgdb.h - reduce KGDB_COMPILED_DBG_BRK_IMM to fit constraint 'I'
-          kgdb_file = os.path.join(base, 'arch/arm64/include/asm/kgdb.h')
-          if os.path.exists(kgdb_file):
-              with open(kgdb_file, 'r') as f:
-                  content = f.read()
-              new_content = re.sub(r'(KGDB_COMPILED_DBG_BRK_IMM\s+)0x401', r'\g<1>0x3', content)
-              with open(kgdb_file, 'w') as f:
-                  f.write(new_content)
-              print(f"Patched: {kgdb_file}")
-              with open(kgdb_file, 'r') as f:
-                  if '0x3' in f.read():
-                      print("Verify OK: KGDB_COMPILED_DBG_BRK_IMM = 0x3")
-                  else:
-                      print("Verify FAILED!")
-          else:
-              print(f"NOT FOUND: {kgdb_file}")
-          
-          # Patch 3: Also patch any other files that reference 0x401 for KGDB
-          for root, dirs, files in os.walk(os.path.join(base, 'arch/arm64/include')):
-              for fn in files:
-                  fp = os.path.join(root, fn)
-                  try:
-                      with open(fp, 'r') as f:
-                          c = f.read()
-                      if '0x401' in c and 'KGDB' in c:
-                          new_c = re.sub(r'(KGDB_COMPILED_DBG_BRK_IMM\s+)0x401', r'\g<1>0x3', c)
-                          with open(fp, 'w') as f:
-                              f.write(new_c)
-                          print(f"Patched KGDB in: {fp}")
-                  except:
-                      pass
-          
-          print("=== All patches applied ===")
-          PYEOF
+          echo "=== Patch 3: other KGDB files ==="
+          find arch/arm64/include -type f -exec grep -l '0x401' {} \; | while read f; do
+            if grep -q 'KGDB' "$f"; then
+              sed -i 's/KGDB_COMPILED_DBG_BRK_IMM\s\+0x401/KGDB_COMPILED_DBG_BRK_IMM 0x3/g' "$f"
+              echo "Patched KGDB in: $f"
+            fi
+          done
           
           echo "=== Verify patches ==="
-          grep -n "0x3" arch/arm64/include/asm/kgdb.h | head -5
-          grep -n "get_current_stack_pointer" arch/arm64/include/asm/stack_pointer.h | head -5
+          grep -n "0x3" arch/arm64/include/asm/kgdb.h | head -5 || true
+          grep -n "get_current_stack_pointer" arch/arm64/include/asm/stack_pointer.h | head -5 || true
 
       - name: Checkout KernelSU AnyKernel3
         run: |
