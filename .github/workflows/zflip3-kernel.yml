@@ -1,0 +1,396 @@
+name: Build Z Flip 3 Kernel + KernelSU + DroidSpaces
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu_version:
+        description: 'KernelSU version (e.g. v0.9.4, v0.10.0)'
+        required: false
+        default: 'v0.9.4'
+      android_version:
+        description: 'Android version (13 or 14 or 15)'
+        required: false
+        default: '15'
+  push:
+    branches:
+      - main
+
+env:
+  DEVICE: SM-F7110
+  DEFCONFIG: vendor/b2q_chn_openx_defconfig
+  ARCH: arm64
+  SUBARCH: arm64
+  KERNEL_VERSION: 5.4.274
+  LINUX_GITHUB_REPO: wwyman94/zflip3-kernel-source
+  ANDROID_VERSION: "15"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Set KernelSU version
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "KERNELSU_VERSION=${{ github.event.inputs.kernelsu_version }}" >> $GITHUB_ENV
+          else
+            echo "KERNELSU_VERSION=v0.9.4" >> $GITHUB_ENV
+          fi
+          echo "Using KernelSU version: ${{ env.KERNELSU_VERSION }}"
+
+      - name: Checkout kernel source
+        run: |
+          echo "Cloning from ${{ env.LINUX_GITHUB_REPO }}"
+          git clone --depth=1 https://github.com/${{ env.LINUX_GITHUB_REPO }}.git kernel_source
+          cd kernel_source
+          echo "Kernel SHA: $(git rev-parse --short HEAD)"
+          echo "=== Fixing script permissions ==="
+          chmod +x scripts/*.sh 2>/dev/null || true
+          chmod +x scripts/config 2>/dev/null || true
+          
+          echo "=== Fixing Makefiles for Make 4.3+ compatibility ==="
+          for mf in arch/arm64/Makefile arch/arm64/kernel/Makefile; do
+            if [ -f "$mf" ]; then
+              echo "Patching $mf..."
+              sed -i 's|$(obj)/%.o: $(src)/%.c|$(obj)/%.o := $(src)/%.c|g' "$mf"
+              sed -i 's|$(obj)/%.o: $(src)/%.S|$(obj)/%.o := $(src)/%.S|g' "$mf"
+              sed -i 's|%/%.o: %/%.c|$(obj)/%.o: $(src)/%.c|g' "$mf"
+              sed -i 's|%/%.o: %/%.S|$(obj)/%.o: $(src)/%.S|g' "$mf"
+              echo "Patched $mf"
+            fi
+          done
+
+      - name: Patch kernel source with Python3
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_source
+          
+          echo "=== Installing Python3 ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3
+          
+          echo "=== Patching with Python3 ==="
+          python3 << 'PYEOF'
+          import os
+          import re
+          
+          base = os.getcwd()
+          
+          # Patch 1: stack_pointer.h - replace global register variable with inline asm
+          sp_file = os.path.join(base, 'arch/arm64/include/asm/stack_pointer.h')
+          if os.path.exists(sp_file):
+              with open(sp_file, 'r') as f:
+                  content = f.read()
+              new_content = '''/* SPDX-License-Identifier: GPL-2.0 */
+/* Patched for Clang 18+ compatibility */
+#ifndef __ASM_STACK_POINTER_H
+#define __ASM_STACK_POINTER_H
+
+static inline unsigned long get_current_stack_pointer(void)
+{
+    unsigned long sp;
+    __asm__ volatile("mov %0, sp" : "=r" (sp));
+    return sp;
+}
+
+#define current_stack_pointer get_current_stack_pointer()
+
+#endif /* __ASM_STACK_POINTER_H */
+'''
+              with open(sp_file, 'w') as f:
+                  f.write(new_content)
+              print(f"Patched: {sp_file}")
+          else:
+              print(f"NOT FOUND: {sp_file}")
+          
+          # Patch 2: kgdb.h - reduce KGDB_COMPILED_DBG_BRK_IMM to fit constraint 'I'
+          kgdb_file = os.path.join(base, 'arch/arm64/include/asm/kgdb.h')
+          if os.path.exists(kgdb_file):
+              with open(kgdb_file, 'r') as f:
+                  content = f.read()
+              new_content = re.sub(r'(KGDB_COMPILED_DBG_BRK_IMM\s+)0x401', r'\g<1>0x3', content)
+              with open(kgdb_file, 'w') as f:
+                  f.write(new_content)
+              print(f"Patched: {kgdb_file}")
+              with open(kgdb_file, 'r') as f:
+                  if '0x3' in f.read():
+                      print("Verify OK: KGDB_COMPILED_DBG_BRK_IMM = 0x3")
+                  else:
+                      print("Verify FAILED!")
+          else:
+              print(f"NOT FOUND: {kgdb_file}")
+          
+          # Patch 3: Also patch any other files that reference 0x401 for KGDB
+          for root, dirs, files in os.walk(os.path.join(base, 'arch/arm64/include')):
+              for fn in files:
+                  fp = os.path.join(root, fn)
+                  try:
+                      with open(fp, 'r') as f:
+                          c = f.read()
+                      if '0x401' in c and 'KGDB' in c:
+                          new_c = re.sub(r'(KGDB_COMPILED_DBG_BRK_IMM\s+)0x401', r'\g<1>0x3', c)
+                          with open(fp, 'w') as f:
+                              f.write(new_c)
+                          print(f"Patched KGDB in: {fp}")
+                  except:
+                      pass
+          
+          print("=== All patches applied ===")
+          PYEOF
+          
+          echo "=== Verify patches ==="
+          grep -n "0x3" arch/arm64/include/asm/kgdb.h | head -5
+          grep -n "get_current_stack_pointer" arch/arm64/include/asm/stack_pointer.h | head -5
+
+      - name: Checkout KernelSU AnyKernel3
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git
+
+      - name: Checkout KernelSU source
+        run: |
+          cd $GITHUB_WORKSPACE
+          KSU_REF="${{ env.KERNELSU_VERSION }}"
+          echo "Cloning KernelSU with ref: $KSU_REF"
+          
+          if [ "$KSU_REF" = "main" ]; then
+            git clone --depth=1 https://github.com/tiann/KernelSU.git kernelsu-source
+          else
+            git clone --depth=1 --branch "$KSU_REF" https://github.com/tiann/KernelSU.git kernelsu-source || \
+            (git clone --depth=1 https://github.com/tiann/KernelSU.git kernelsu-source && \
+             cd kernelsu-source && git fetch origin tag "$KSU_REF" && git checkout "$KSU_REF")
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison build-essential ccache flex git \
+            libncurses-dev libssl-dev pahole python3 \
+            unzip xz-utils zlib1g-dev cpio gnupg \
+            clang lld
+            
+          clang --version
+          ld.lld --version
+
+      - name: Setup ccache
+        run: |
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> $GITHUB_ENV
+          echo "CCACHE_SIZE=10G" >> $GITHUB_ENV
+          ccache -M 10G
+          ccache -z
+
+      - name: Patch kernel source for KernelSU
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_source
+          
+          echo "=== Applying KernelSU patch ==="
+          KERNELSOURCE="$GITHUB_WORKSPACE/kernel_source"
+          KERNELSUSOURCE="$GITHUB_WORKSPACE/kernelsu-source"
+          
+          if [ -f "$KERNELSUSOURCE/kernel/generic.sh" ]; then
+            bash "$KERNELSUSOURCE/kernel/generic.sh" "$KERNELSOURCE" "${{ env.KERNELSU_VERSION }}"
+          else
+            echo "Trying alternate patch method..."
+            if [ -d "$KERNELSUSOURCE/kernel" ]; then
+              KSPATCH="$KERNELSUSOURCE/kernel"
+              if [ -f "$KSPATCH/kernelsu.c" ]; then
+                cp "$KSPATCH/kernelsu.c" "$KERNELSOURCE/drivers/"
+                cp -r "$KSPATCH/kernelsu" "$KERNELSOURCE/drivers/" 2>/dev/null || true
+              fi
+            fi
+          fi
+          
+          echo "=== Patch done ==="
+
+      - name: Configure kernel
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_source
+          
+          echo "=== Applying DroidSpaces-compatible kernel config ==="
+          
+          make O=out ${{ env.DEFCONFIG }} ARCH=${{ env.ARCH }}
+          
+          scripts/config --file out/.config \
+            --enable CONFIG_SYSVIPC \
+            --enable CONFIG_POSIX_MQUEUE \
+            --enable CONFIG_IPC_NS \
+            --enable CONFIG_PID_NS \
+            --enable CONFIG_NET_NS \
+            --enable CONFIG_UTS_NS \
+            --enable CONFIG_USER_NS \
+            --enable CONFIG_DEVPTS_MULTIPLE_INSTANCES \
+            --enable CONFIG_DEVTMPFS \
+            --enable CONFIG_DEVTMPFS_MOUNT \
+            --enable CONFIG_CGROUPS \
+            --enable CONFIG_CGROUP_SCHED \
+            --enable CONFIG_CGROUP_PIDS \
+            --enable CONFIG_CGROUP_DEVICE \
+            --enable CONFIG_CGROUP_FREEZER \
+            --enable CONFIG_CGROUP_CPUACCT \
+            --enable CONFIG_CGROUP_BPF \
+            --enable CONFIG_CGROUP_DEBUG \
+            --enable CONFIG_BLK_CGROUP \
+            --enable CONFIG_BLK_CGROUP_IOPRIO \
+            --enable CONFIG_BPF_SYSCALL \
+            --enable CONFIG_BPF_JIT \
+            --enable CONFIG_USERFAULTFD \
+            --enable CONFIG_KALLSYMS \
+            --enable CONFIG_KALLSYMS_ALL \
+            --enable CONFIG_OVERLAY_FS \
+            --enable CONFIG_FUSE_FS \
+            --enable CONFIG_EXT4_FS \
+            --enable CONFIG_F2FS_FS \
+            --enable CONFIG_VIRT_DRIVERS \
+            --enable CONFIG_VIRTIO \
+            --enable CONFIG_VIRTIO_MMIO \
+            --enable CONFIG_VIRTIO_PCI \
+            --enable CONFIG_VIRTIO_BALLOON \
+            --enable CONFIG_VIRTIO_INPUT \
+            --enable CONFIG_Samsung_BSP \
+            --enable CONFIG_EXFAT_FS \
+            --enable CONFIG_NLS \
+            --enable CONFIG_NLS_DEFAULT \
+            --enable CONFIG_NLS_UTF8 \
+            --enable CONFIG_SOUND \
+            --enable CONFIG_SND \
+            --enable CONFIG_FTRACE \
+            --enable CONFIG_FUNCTION_TRACER \
+            --enable CONFIG_DYNAMIC_FTRACE \
+            --enable CONFIG_HAVE_FUNCTION_GRAPH_TRACER \
+            --enable CONFIG_ARM64 \
+            --enable CONFIG_ARM64_TAGGED_ADDR_ABI \
+            --enable CONFIG_COMPAT_VDSO \
+            --enable CONFIG_MODULES \
+            --enable CONFIG_MODULE_UNLOAD \
+            --enable CONFIG_MODVERSIONS \
+            --enable CONFIG_RD_LZ4 \
+            --enable CONFIG_RD_LZMA \
+            --enable CONFIG_RD_XZ \
+            --enable CONFIG_RD_GZIP \
+            --enable CONFIG_CMA \
+            --enable CONFIG_SECURITY \
+            --enable CONFIG_SECURITY_SELINUX \
+            --disable CONFIG_WALT \
+            --disable CONFIG_MTK_WALT 2>/dev/null || true
+          
+          echo "=== Running olddefconfig ==="
+          yes "" | make olddefconfig O=out ARCH=${{ env.ARCH }} || true
+          grep "CONFIG_WALT" out/.config || echo "WALT not set (good)"
+
+      - name: Build kernel
+        id: build
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel_source
+          export PATH="/usr/lib/ccache:$PATH"
+          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
+          
+          echo "=== Starting kernel build ==="
+          echo "Jobs: $(nproc)"
+          echo "Start time: $(date)"
+          echo "Using Clang: $(which clang)"
+          clang --version
+          
+          make -j$(nproc) \
+            O=out \
+            ARCH=${{ env.ARCH }} \
+            CC="ccache clang" \
+            CXX="ccache clang++" \
+            AR="ccache llvm-ar" \
+            NM="ccache llvm-nm" \
+            OBJCOPY="ccache llvm-objcopy" \
+            OBJDUMP="ccache llvm-objdump" \
+            STRIP="ccache llvm-strip" \
+            HOSTCC="clang" \
+            HOSTCXX="clang++" \
+            HOSTAR="llvm-ar" \
+            LLVM=1 \
+            2>&1 | tee build.log
+          
+          BUILD_STATUS=${PIPESTATUS[0]}
+          echo "=== Build finished with status $BUILD_STATUS at $(date) ==="
+          
+          grep -i "error:" build.log | head -20 || echo "No errors found in log"
+          
+          echo "=== Searching for kernel Image ==="
+          find out -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" 2>/dev/null | head -10
+          
+          if [ -f out/arch/arm64/boot/Image ]; then
+            echo "Image found: $(ls -lh out/arch/arm64/boot/Image)"
+            echo "IMAGE_PATH=out/arch/arm64/boot/Image" >> $GITHUB_ENV
+          elif [ -f out/arch/arm64/boot/Image.gz ]; then
+            echo "Image.gz found: $(ls -lh out/arch/arm64/boot/Image.gz)"
+            echo "IMAGE_PATH=out/arch/arm64/boot/Image.gz" >> $GITHUB_ENV
+          elif [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            echo "Image.gz-dtb found: $(ls -lh out/arch/arm64/boot/Image.gz-dtb)"
+            echo "IMAGE_PATH=out/arch/arm64/boot/Image.gz-dtb" >> $GITHUB_ENV
+          elif [ -f out/vmlinux ]; then
+            echo "vmlinux found: $(ls -lh out/vmlinux)"
+            echo "IMAGE_PATH=out/vmlinux" >> $GITHUB_ENV
+          else
+            echo "ERROR: No kernel Image found!"
+            BUILD_STATUS=1
+          fi
+          
+          echo "build_status=$BUILD_STATUS" >> $GITHUB_OUTPUT
+          ccache -s
+          exit $BUILD_STATUS
+
+      - name: Package AnyKernel3
+        if: success()
+        run: |
+          cd $GITHUB_WORKSPACE
+          
+          IMAGE=$(find kernel_source/out -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" 2>/dev/null | grep -v dtb | head -1)
+          [ -z "$IMAGE" ] && IMAGE=$(find kernel_source/out -name "vmlinux" 2>/dev/null | head -1)
+          
+          if [ -n "$IMAGE" ] && [ -f "$IMAGE" ]; then
+            mkdir -p AnyKernel3
+            cp "$IMAGE" AnyKernel3/
+            
+            DTB_DIR=$(find kernel_source/out/arch/arm64/boot -name "*.dtb" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+            [ -n "$DTB_DIR" ] && cp -r "$DTB_DIR"/*.dtb AnyKernel3/ 2>/dev/null || true
+            
+            cat > AnyKernel3/anykernel.properties << 'EOF'
+kernel.string=Z Flip 3 Kernel + KernelSU + DroidSpaces
+device.name1=SM-F7110
+device.name2=b2q_chn_openx
+device.name3=lahaina
+arch=arm64
+kernel_version=5.4.274
+ksu_version=__KSU_VER__
+android_version=15
+EOF
+            sed -i "s/__KSU_VER__/${{ env.KERNELSU_VERSION }}/" AnyKernel3/anykernel.properties
+            
+            cd AnyKernel3
+            zip -r9 ../zflip3-kernel-ksu.zip . -x "*.git*"
+            echo "Flashable zip created: $(ls -lh $GITHUB_WORKSPACE/zflip3-kernel-ksu.zip)"
+          else
+            echo "ERROR: No Image found to package"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zflip3-kernel-ksu
+          path: zflip3-kernel-ksu.zip
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel_source/build.log
+          retention-days: 14
+
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "=== Build failed ==="
+          tail -50 kernel_source/build.log 2>/dev/null || echo "No log found"
