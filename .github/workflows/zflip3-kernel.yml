@@ -310,16 +310,14 @@ jobs:
             DTB_DIR=$(find kernel_source/out/arch/arm64/boot -name "*.dtb" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
             [ -n "$DTB_DIR" ] && cp -r "$DTB_DIR"/*.dtb AnyKernel3/ 2>/dev/null || true
             
-            cat > AnyKernel3/anykernel.properties << 'EOF'
-kernel.string=Z Flip 3 Kernel + KernelSU + DroidSpaces
-device.name1=SM-F7110
-device.name2=b2q_chn_openx
-device.name3=lahaina
-arch=arm64
-kernel_version=5.4.274
-ksu_version=__KSU_VER__
-android_version=15
-EOF
+            echo 'kernel.string=Z Flip 3 Kernel + KernelSU + DroidSpaces' > AnyKernel3/anykernel.properties
+            echo 'device.name1=SM-F7110' >> AnyKernel3/anykernel.properties
+            echo 'device.name2=b2q_chn_openx' >> AnyKernel3/anykernel.properties
+            echo 'device.name3=lahaina' >> AnyKernel3/anykernel.properties
+            echo 'arch=arm64' >> AnyKernel3/anykernel.properties
+            echo 'kernel_version=5.4.274' >> AnyKernel3/anykernel.properties
+            echo 'ksu_version=__KSU_VER__' >> AnyKernel3/anykernel.properties
+            echo 'android_version=15' >> AnyKernel3/anykernel.properties
             sed -i "s/__KSU_VER__/${{ env.KERNELSU_VERSION }}/" AnyKernel3/anykernel.properties
             
             cd AnyKernel3
